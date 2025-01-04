@@ -17,9 +17,7 @@
 use super::{super::ops::*, eddsa_digest, ED25519_PUBLIC_KEY_LEN};
 use crate::{
     cpu, digest, error,
-    io::der,
-    pkcs8, rand,
-    signature::{self, KeyPair as SigningKeyPair},
+    signature::{self},
 };
 
 /// An Ed25519 key pair, for signing.
@@ -37,93 +35,7 @@ pub struct Ed25519KeyPair {
 derive_debug_via_field!(Ed25519KeyPair, stringify!(Ed25519KeyPair), public_key);
 
 impl Ed25519KeyPair {
-    /// Generates a new key pair and returns the key pair serialized as a
-    /// PKCS#8 document.
-    ///
-    /// The PKCS#8 document will be a v2 `OneAsymmetricKey` with the public key,
-    /// as described in [RFC 5958 Section 2]; see [RFC 8410 Section 10.3] for an
-    /// example.
-    ///
-    /// [RFC 5958 Section 2]: https://tools.ietf.org/html/rfc5958#section-2
-    /// [RFC 8410 Section 10.3]: https://tools.ietf.org/html/rfc8410#section-10.3
-    pub fn generate_pkcs8(
-        rng: &dyn rand::SecureRandom,
-    ) -> Result<pkcs8::Document, error::Unspecified> {
-        let cpu_features = cpu::features();
-        let seed: [u8; SEED_LEN] = rand::generate(rng)?.expose();
-        let key_pair = Self::from_seed_(&seed, cpu_features);
-        Ok(pkcs8::wrap_key(
-            &PKCS8_TEMPLATE,
-            &seed[..],
-            key_pair.public_key().as_ref(),
-        ))
-    }
-
-    /// Constructs an Ed25519 key pair by parsing an unencrypted PKCS#8 v2
-    /// Ed25519 private key.
-    ///
-    /// `openssl genpkey -algorithm ED25519` generates PKCS# v1 keys, which
-    /// require the use of `Ed25519KeyPair::from_pkcs8_maybe_unchecked()`
-    /// instead of `Ed25519KeyPair::from_pkcs8()`.
-    ///
-    /// The input must be in PKCS#8 v2 format, and in particular it must contain
-    /// the public key in addition to the private key. `from_pkcs8()` will
-    /// verify that the public key and the private key are consistent with each
-    /// other.
-    ///
-    /// Some early implementations of PKCS#8 v2, including earlier versions of
-    /// *ring* and other implementations, wrapped the public key in the wrong
-    /// ASN.1 tags. Both that incorrect form and the standardized form are
-    /// accepted.
-    ///
-    /// If you need to parse PKCS#8 v1 files (without the public key) then use
-    /// `Ed25519KeyPair::from_pkcs8_maybe_unchecked()` instead.
-    pub fn from_pkcs8(pkcs8: &[u8]) -> Result<Self, error::KeyRejected> {
-        let version = pkcs8::Version::V2Only(pkcs8::PublicKeyOptions {
-            accept_legacy_ed25519_public_key_tag: true,
-        });
-        let (seed, public_key) = unwrap_pkcs8(version, untrusted::Input::from(pkcs8))?;
-        Self::from_seed_and_public_key(
-            seed.as_slice_less_safe(),
-            public_key.unwrap().as_slice_less_safe(),
-        )
-    }
-
-    /// Constructs an Ed25519 key pair by parsing an unencrypted PKCS#8 v1 or v2
-    /// Ed25519 private key.
-    ///
-    /// `openssl genpkey -algorithm ED25519` generates PKCS# v1 keys.
-    ///
-    /// It is recommended to use `Ed25519KeyPair::from_pkcs8()`, which accepts
-    /// only PKCS#8 v2 files that contain the public key.
-    /// `from_pkcs8_maybe_unchecked()` parses PKCS#2 files exactly like
-    /// `from_pkcs8()`. It also accepts v1 files. PKCS#8 v1 files do not contain
-    /// the public key, so when a v1 file is parsed the public key will be
-    /// computed from the private key, and there will be no consistency check
-    /// between the public key and the private key.
-    ///
-    /// Some early implementations of PKCS#8 v2, including earlier versions of
-    /// *ring* and other implementations, wrapped the public key in the wrong
-    /// ASN.1 tags. Both that incorrect form and the standardized form are
-    /// accepted.
-    ///
-    /// PKCS#8 v2 files are parsed exactly like `Ed25519KeyPair::from_pkcs8()`.
-    pub fn from_pkcs8_maybe_unchecked(pkcs8: &[u8]) -> Result<Self, error::KeyRejected> {
-        let version = pkcs8::Version::V1OrV2(pkcs8::PublicKeyOptions {
-            accept_legacy_ed25519_public_key_tag: true,
-        });
-        let (seed, public_key) = unwrap_pkcs8(version, untrusted::Input::from(pkcs8))?;
-        if let Some(public_key) = public_key {
-            Self::from_seed_and_public_key(
-                seed.as_slice_less_safe(),
-                public_key.as_slice_less_safe(),
-            )
-        } else {
-            Self::from_seed_unchecked(seed.as_slice_less_safe())
-        }
-    }
-
-    /// Constructs an Ed25519 key pair from the private key seed `seed` and its
+     /// Constructs an Ed25519 key pair from the private key seed `seed` and its
     /// public key `public_key`.
     ///
     /// It is recommended to use `Ed25519KeyPair::from_pkcs8()` instead.
@@ -173,6 +85,33 @@ impl Ed25519KeyPair {
     fn from_seed_(seed: &Seed, cpu_features: cpu::Features) -> Self {
         let h = digest::digest(&digest::SHA512, seed);
         let (private_scalar, private_prefix) = h.as_ref().split_at(SCALAR_LEN);
+
+        let private_scalar =
+            MaskedScalar::from_bytes_masked(private_scalar.try_into().unwrap()).into();
+
+        let a = ExtPoint::from_scalarmult_base_consttime(&private_scalar, cpu_features);
+
+        Self {
+            private_scalar,
+            private_prefix: private_prefix.try_into().unwrap(),
+            public_key: PublicKey(a.into_encoded_point(cpu_features)),
+        }
+    }
+
+    /// Constructs a Ed25519 key pair from raw private key bytes.
+    ///
+    /// Since the public key is not given, the public key will be computed from
+    /// the private key. It is not possible to detect misuse or corruption of
+    /// the private key since the public key isn't given as input.
+    pub fn from_bytes(raw_pk: &[u8]) -> Result<Self, error::KeyRejected> {
+        let raw_pk = raw_pk
+            .try_into()
+            .map_err(|_| error::KeyRejected::invalid_encoding())?;
+        Ok(Self::from_bytes_(raw_pk, cpu::features()))
+    }
+
+    fn from_bytes_(private_scalar: &RawPK, cpu_features: cpu::Features) -> Self {
+        let (private_scalar, private_prefix) = private_scalar.as_ref().split_at(SCALAR_LEN);
 
         let private_scalar =
             MaskedScalar::from_bytes_masked(private_scalar.try_into().unwrap()).into();
@@ -246,19 +185,6 @@ impl AsRef<[u8]> for PublicKey {
 
 derive_debug_self_as_ref_hex_bytes!(PublicKey);
 
-fn unwrap_pkcs8(
-    version: pkcs8::Version,
-    input: untrusted::Input,
-) -> Result<(untrusted::Input, Option<untrusted::Input>), error::KeyRejected> {
-    let (private_key, public_key) = pkcs8::unwrap_key(&PKCS8_TEMPLATE, version, input)?;
-    let private_key = private_key
-        .read_all(error::Unspecified, |input| {
-            der::expect_tag_and_get_value(input, der::Tag::OctetString)
-        })
-        .map_err(|error::Unspecified| error::KeyRejected::invalid_encoding())?;
-    Ok((private_key, public_key))
-}
-
 type Prefix = [u8; PREFIX_LEN];
 const PREFIX_LEN: usize = digest::SHA512_OUTPUT_LEN - SCALAR_LEN;
 
@@ -267,9 +193,5 @@ const SIGNATURE_LEN: usize = ELEM_LEN + SCALAR_LEN;
 type Seed = [u8; SEED_LEN];
 const SEED_LEN: usize = 32;
 
-static PKCS8_TEMPLATE: pkcs8::Template = pkcs8::Template {
-    bytes: include_bytes!("ed25519_pkcs8_v2_template.der"),
-    alg_id_range: core::ops::Range { start: 7, end: 12 },
-    curve_id_index: 0,
-    private_key_index: 0x10,
-};
+type RawPK = [u8; RAW_PK_LEN];
+const RAW_PK_LEN: usize = 32;

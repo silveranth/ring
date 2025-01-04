@@ -111,9 +111,9 @@ impl Ed25519KeyPair {
     }
 
     fn from_bytes_(private_scalar: &RawPK, cpu_features: cpu::Features) -> Self {
-        //let private_scalar =
-            //MaskedScalar::from_bytes_masked(private_scalar.try_into().unwrap()).into();
-        let private_scalar = Scalar::from_bytes_checked(*private_scalar).unwrap();
+        let private_scalar =
+            MaskedScalar::from_bytes_masked(private_scalar.as_ref().try_into().unwrap()).into();
+
         let a = ExtPoint::from_scalarmult_base_consttime(&private_scalar, cpu_features);
         let private_prefix: Prefix = [0u8;32];
         Self {
